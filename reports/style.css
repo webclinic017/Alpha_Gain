@@ -1,0 +1,53 @@
+
+  
+  td, th {
+    border: 1px solid #dddddd;
+    text-align: left;
+    padding: 8px;
+  }
+  
+  tr:nth-child(even) {
+    background-color: #dddddd;
+  }
+  * {
+    box-sizing: border-box;
+  }
+  .grid-container {
+    display: grid;
+    grid-template-columns: auto auto auto;
+    background-color: #ffffff;
+    padding: 1px;
+  }
+  .grid-item {
+    background-color: rgba(255, 255, 255, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.8);
+    padding: 20px;
+    font-size: 10px;
+    text-align: center;
+  }
+  .box {
+    float: left;
+    width: 70%;
+    padding: 1px;
+  }
+  
+  .box2 {
+    float: right;
+    width: 30%;
+    padding: 1px;
+    font-family: arial, sans-serif;
+    border-collapse: collapse;
+  }
+  .box3 {
+    float: right;
+    width: 50%;
+    padding: 1px;
+    font-family: arial, sans-serif;
+    border-collapse: collapse;
+  }
+  
+  .clearfix::after {
+    content: "";
+    clear: both;
+    display: table;
+  }

@@ -1,0 +1,4 @@
+
+*.pyc
+env/Lib/site-packages/_cffi_backend.cp38-win_amd64.pyd
+*.log

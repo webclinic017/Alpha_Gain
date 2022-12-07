@@ -1,0 +1,828 @@
+from utils import util_functions as util
+from utils import broker_api_functions as baf
+import datetime, time
+import requests
+import logging
+import re
+from config import Config
+import os
+import mibian
+from utils.prostocks_api_helper import StarApiPy
+from multiprocessing import Pool
+
+
+def bsm_options_pricing(brokerApi, exchangeToken, exchange, strikePrice, expiry, closePrice, tradeSymbol, instrumentType):
+    bsmDataDict = {}
+    try:
+        interestRate = 6
+        fDate = datetime.datetime.strptime(str(util.get_date_time_formatted("%Y-%m-%d")), "%Y-%m-%d")
+        lDate = datetime.datetime.strptime(str(expiry), "%Y-%m-%d")
+        daysToExpiry1 = 1 
+        daysToExpiry = lDate - fDate
+
+        if (daysToExpiry.days == 0):
+            daysToExpiry1 = 1
+        else:
+            daysToExpiry1 = int(daysToExpiry.days)
+    
+        quoteData = get_quotes(brokerApi, exchangeToken, exchange=exchange)
+
+        fnoLastPrice = quoteData['lp']
+
+        if (float(fnoLastPrice) > 0):
+            # bsmDataDict['OI_VALUE'] = float(quoteData[instToken]['oi']) * float(closePrice)
+            bsmDataDict['VOLUME_VALUE']= float(quoteData['v']) * float(closePrice)
+
+            if (instrumentType == 'PUT'):
+                iv = mibian.BS([closePrice, strikePrice, interestRate, daysToExpiry1], putPrice=fnoLastPrice)                
+                c = mibian.BS([closePrice, strikePrice, interestRate, daysToExpiry1], volatility=float("{:.2f}".format(iv.impliedVolatility)))
+                bsmDataDict['delta'] = float("{:.2f}".format(c.putDelta))
+                bsmDataDict['theta'] = float("{:.2f}".format(c.putTheta))
+            else:
+                iv = mibian.BS([closePrice, strikePrice, interestRate, daysToExpiry1], callPrice=fnoLastPrice)
+                c = mibian.BS([closePrice, strikePrice, interestRate, daysToExpiry1], volatility=float("{:.2f}".format(iv.impliedVolatility)))
+                bsmDataDict['delta'] = float("{:.2f}".format(c.callDelta))
+                bsmDataDict['theta'] = float("{:.2f}".format(c.callTheta))
+            
+            bsmDataDict['vega'] = float("{:.2f}".format(c.vega))
+            bsmDataDict['gamma'] = float("{:.5f}".format(c.gamma))
+
+            bsmDataDict['IMPLIED_VOLATILITY']= float("{:.2f}".format(iv.impliedVolatility))
+            bsmDataDict['daysToExpiry'] = daysToExpiry1
+            bsmDataDict['status'] = 'success'
+            bsmDataDict['remarks'] = 'success'               
+        else:            
+            bsmDataDict['status'] = 'failed'
+            bsmDataDict['remarks'] = 'FNO Price is zero for ' + tradeSymbol
+
+    except Exception as e:            
+        bsmDataDict['status'] = 'failed'
+        bsmDataDict['remarks'] = "Errored while getting the BSM Options Pricing for " + tradeSymbol + ": "+ str(e)
+    
+    return bsmDataDict
+
+def get_quotes(brokerApi, exchangeToken, exchange='NSE'):
+    try:
+        quotes = brokerApi.get_quotes(exchange, str(exchangeToken))
+        return quotes
+    except:        
+        try:
+            time.sleep(1)
+            quotes = brokerApi.get_quotes(exchange, str(exchangeToken))
+            return quotes
+        except:
+            time.sleep(2)            
+            logging.info("Trying LTP after 3 seconds")            
+            quotes = brokerApi.get_quotes(exchange, str(exchangeToken))
+            return quotes
+
+def get_last_traded_price(brokerApi, exchangeToken, exchange='NSE'):
+    try:
+        ltp = brokerApi.get_quotes(exchange, str(exchangeToken))
+        return float(ltp['lp'])
+    except:        
+        try:
+            time.sleep(1)
+            ltp = brokerApi.get_quotes(exchange, str(exchangeToken))
+            return float(ltp['lp'])            
+        except:
+            time.sleep(2)            
+            logging.info("Trying LTP after 3 seconds")            
+            ltp = brokerApi.get_quotes(exchange, str(exchangeToken))
+            return float(ltp['lp'])
+
+def get_margin_data(brokerApi, broker, accountId):
+    try:
+        if (broker == 'ZERODHA'):
+            marginData = baf.getKiteMargins(brokerApi)    
+            availableCash =  float(marginData['available']['cash'])
+            totalCashValue = float(marginData['net']) + float(marginData['utilised']['delivery'])
+            usedMargin = float(marginData['utilised']['debits'])
+            availableMargin =  float(marginData['net'])
+            return availableCash, totalCashValue, usedMargin, availableMargin
+        elif (broker == 'PROSTOCKS'):
+
+            data = "jData={\"uid\":\""+str(accountId)+"\", \"actid\":\""+str(accountId)+"\"}&jKey=" + brokerApi
+            response = requests.post('https://starapi.prostocks.com/NorenWClientTP/Limits', data=data)
+            marginData = response.json()
+
+            if (marginData['stat'] == 'Ok'):
+                availableCash =  float(marginData['cash'])
+                totalCashValue = float(marginData['cash'])
+                usedMargin = 0
+                if 'marginused' in marginData:
+                    usedMargin = float(marginData['marginused'])
+                availableMargin =  availableCash - usedMargin
+
+                return availableCash, totalCashValue, usedMargin, availableMargin
+            else:
+                return -1, -1, -1, -1
+    except Exception as e:    
+        alertMsg = f"Exception occurred in get_margin_data: {str(e)}"
+        util.add_logs(cnx, mySQLCursor, 'ERROR',  alertMsg, sysDict)
+
+def update_cash_positions(cnx, mySQLCursor, tradeAccount, availableCash, totalCashValue, usedMargin, availableMargin):
+    try:
+        updatedOn = util.get_date_time_formatted("%Y-%m-%d %H:%M:%S")        
+        updateQuery = ("UPDATE USR_TRADE_ACCOUNTS SET AVAILABLE_MARGIN='"+str(availableMargin)+"', AVAILABLE_CASH='"+str(availableCash)+"', \
+            USED_MARGIN='"+str(usedMargin)+"', TOTAL_CASH_VALUE='"+str(totalCashValue)+"', UPDATED_ON= '"+str(updatedOn)+"' WHERE TRADE_ACCOUNT='"+str(tradeAccount)+"'")
+
+        mySQLCursor.execute(updateQuery)
+        cnx.commit()
+    except Exception as e:    
+        alertMsg = f"Exception occurred in update_cash_positions: {str(e)}"
+        util.add_logs(cnx, mySQLCursor, 'INFO',  alertMsg, sysDict)
+
+def update_order_status_prostocks(accessToken, cnx, mySQLCursor, accountId, uatFlag = False):
+
+    try:
+        data = "jData={\"uid\":\""+accountId+"\", \"prd\":\"C\"}&jKey=" + accessToken
+        response = requests.post('https://starapi.prostocks.com/NorenWClientTP/OrderBook', data=data)
+        orderData = response.json()
+
+        updatedOn = util.get_date_time_formatted("%Y-%m-%d %H:%M:%S")   
+        orderRemarks = ''     
+        if (isinstance(orderData, list) and len(orderData) > 0 and orderData[0]['stat'] == 'Ok'):
+            for orders in orderData:
+                try:
+                    product = orders["prd"]
+                    transactionType = orders["trantype"]
+                    
+                    orderId = orders["norenordno"]
+                    orderPrice = orders["prc"]
+                    exch = orders["exch"]
+                    tradeSymbol = orders["tsym"]
+                    orderStatus = orders["status"] 
+
+                    if (orderStatus == 'COMPLETE'):
+                        orderPrice = orders["avgprc"]
+                    elif (orderStatus == 'REJECTED'):
+                        orderRemarks = orders["rejreason"]
+                    elif (orderStatus == 'CANCELED'):
+                        orderRemarks = 'CANCELED'
+
+                    quantity = orders["qty"]
+                    buyValue = float(quantity) * float(orderPrice)
+                    updateQuery = ""
+
+                    if (transactionType == 'B' and exch == 'NFO'):           
+
+                        if(orderStatus == 'COMPLETE'):
+                            selectStatment = "SELECT AUTO_ID FROM TRADE_TRANSACTIONS WHERE SELL_ORDER_STATUS = 'PENDING' AND SELL_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount     
+
+                            # Check if this is exit trade; if yes, update the profit and loss for EXIT BUY
+                            if rowCount == 1:
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_PRICE="+str(orderPrice) + ", SELL_ORDER_STATUS='COMPLETE', TRADE_STATUS='EXITED', SELL_ORDER_DATE='"+str(updatedOn)+"', PROFIT_PERCENT=(("+str(float(orderPrice))+" - BUY_ORDER_PRICE) / BUY_ORDER_PRICE) * -100, PROFIT_AMOUNT=("+str(
+                                        float(orderPrice))+" * QUANTITY) - (BUY_ORDER_PRICE * QUANTITY), TRADE_RESULT = IF ((("+str(float(orderPrice))+" * QUANTITY) - (BUY_ORDER_PRICE * QUANTITY)) > 0, 'GAIN','LOSS') WHERE SELL_ORDER_ID ='"+str(orderId)+"' AND TRADE_STATUS IN ('OPEN')")
+                            else:
+                                # Check if this entry trade; if yes, check for the status of the order and update it
+                                selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE BUY_ORDER_STATUS = 'PENDING' AND BUY_ORDER_ID='"+str(orderId)+"'"
+                                mySQLCursor.execute(selectStatment)
+                                rowCount = mySQLCursor.rowcount                                
+                                if rowCount == 1: 
+                                    updateQuery = ("UPDATE TRADE_TRANSACTIONS SET BUY_ORDER_PRICE="+str(orderPrice) + ", TRADE_STATUS='OPEN', BUY_ORDER_STATUS='COMPLETE', BUY_ORDER_DATE='" + str(updatedOn)+"', BUY_VALUE="+str(buyValue)+" WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+                        
+                        elif( orderStatus == 'REJECTED'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'PENDING' AND BUY_ORDER_STATUS='PENDING' AND BUY_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount
+                                
+                            if rowCount == 1:        
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET TRADE_STATUS='REJECTED', BUY_ORDER_STATUS='REJECTED', ORDER_REMARKS ='" + str(orderRemarks) + "' WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+                            else:
+                                selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'OPEN' AND SELL_ORDER_STATUS = 'PENDING' AND SELL_ORDER_ID='"+str(orderId)+"'"
+                                mySQLCursor.execute(selectStatment)
+                                rowCount = mySQLCursor.rowcount                                
+                                if rowCount == 1: 
+                                    if (re.search('Check Holdings Including BTST', str(orderRemarks)) or re.search('NRO sqroff not allowed', str(orderRemarks))):
+                                        updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_STATUS='ABANDONED', SELL_ORDER_REMARKS ='" +
+                                                        str(orderRemarks) + "' WHERE SELL_ORDER_ID='"+str(orderId) + "'")
+                                    else:
+                                        updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_STATUS='REJECTED', SELL_ORDER_REMARKS ='" +
+                                                        str(orderRemarks) + "' WHERE SELL_ORDER_ID='"+str(orderId) + "'")
+
+
+                    elif( transactionType == 'B' ):
+                        if(orderStatus == 'COMPLETE'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'OPEN' AND BUY_ORDER_STATUS='COMPLETE' AND BUY_ORDER_ID='"+str(orderId) + "'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount
+                            if rowCount == 0:        
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET BUY_ORDER_PRICE="+str(orderPrice) + ", TRADE_STATUS='OPEN', BUY_ORDER_STATUS='COMPLETE', BUY_ORDER_DATE='" + str(updatedOn)+"', BUY_VALUE="+str(buyValue)+" WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+
+
+                        elif( orderStatus == 'REJECTED'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'REJECTED' AND BUY_ORDER_STATUS='REJECTED' AND BUY_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount
+                                
+                            if rowCount == 0:        
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET TRADE_STATUS='REJECTED', BUY_ORDER_STATUS='REJECTED', ORDER_REMARKS ='" + str(orderRemarks) + "' WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+
+
+                        elif( orderStatus == 'CANCELED'):
+                                selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'CANCELED' AND BUY_ORDER_STATUS='CANCELED' AND BUY_ORDER_ID='"+str(orderId)+"'"
+                                mySQLCursor.execute(selectStatment)
+                                rowCount = mySQLCursor.rowcount                           
+                                
+                                if rowCount == 0:        
+                                    updateQuery = ("UPDATE TRADE_TRANSACTIONS SET TRADE_STATUS='CANCELED', BUY_ORDER_STATUS='CANCELED', ORDER_REMARKS ='" +
+                                            str(orderRemarks) + "' WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+    
+
+                    elif (transactionType == 'S' and exch == 'NFO'):           
+
+                        if(orderStatus == 'COMPLETE'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE SELL_ORDER_STATUS = 'PENDING' AND SELL_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount     
+
+                            if rowCount == 1: 
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_PRICE="+str(orderPrice) + ", SELL_ORDER_STATUS='COMPLETE', TRADE_STATUS='EXITED', SELL_ORDER_DATE='"+str(updatedOn)+"', PROFIT_PERCENT=(("+str(float(orderPrice))+" - BUY_ORDER_PRICE) / BUY_ORDER_PRICE) * 100, PROFIT_AMOUNT=("+str(
+                                        float(orderPrice))+" * QUANTITY) - (BUY_ORDER_PRICE * QUANTITY), TRADE_RESULT = IF ((("+str(float(orderPrice))+" * QUANTITY) - (BUY_ORDER_PRICE * QUANTITY)) > 0, 'GAIN','LOSS') WHERE SELL_ORDER_ID ='"+str(orderId)+"' AND TRADE_STATUS IN ('OPEN')")
+
+                            else:
+                                selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE BUY_ORDER_STATUS = 'PENDING' AND BUY_ORDER_ID='"+str(orderId)+"'"
+                                mySQLCursor.execute(selectStatment)
+                                rowCount = mySQLCursor.rowcount                                
+                                if rowCount == 1: 
+                                    updateQuery = ("UPDATE TRADE_TRANSACTIONS SET BUY_ORDER_PRICE="+str(orderPrice) + ", TRADE_STATUS='OPEN', BUY_ORDER_STATUS='COMPLETE', BUY_ORDER_DATE='" + str(updatedOn)+"', BUY_VALUE="+str(buyValue)+" WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+
+
+                        elif( orderStatus == 'REJECTED'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'PENDING' AND BUY_ORDER_STATUS='PENDING' AND BUY_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount
+                                
+                            if rowCount == 1:        
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET TRADE_STATUS='REJECTED', BUY_ORDER_STATUS='REJECTED', ORDER_REMARKS ='" + str(orderRemarks) + "' WHERE BUY_ORDER_ID='"+str(orderId) + "'")
+                            else:
+                                selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS = 'OPEN' AND SELL_ORDER_STATUS = 'PENDING' AND SELL_ORDER_ID='"+str(orderId)+"'"
+                                mySQLCursor.execute(selectStatment)
+                                rowCount = mySQLCursor.rowcount                                
+                                if rowCount == 1: 
+                                    if (re.search('Check Holdings Including BTST', str(orderRemarks)) or re.search('NRO sqroff not allowed', str(orderRemarks))):
+                                        updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_STATUS='ABANDONED', SELL_ORDER_REMARKS ='" +
+                                                        str(orderRemarks) + "' WHERE SELL_ORDER_ID='"+str(orderId) + "'")
+                                    else:
+                                        updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_STATUS='REJECTED', SELL_ORDER_REMARKS ='" +
+                                                        str(orderRemarks) + "' WHERE SELL_ORDER_ID='"+str(orderId) + "'")
+
+
+
+                    elif (transactionType == 'S'):           
+
+                        if(orderStatus == 'COMPLETE'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE SELL_ORDER_STATUS = 'COMPLETE' AND TRADE_STATUS='EXITED' AND SELL_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount     
+
+                            if rowCount == 0: 
+                                updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_ID ='"+str(orderId) + "',  SELL_ORDER_PRICE="+str(orderPrice) + ", SELL_ORDER_STATUS='COMPLETE', TRADE_STATUS='EXITED', SELL_ORDER_DATE='"+str(updatedOn)+"', PROFIT_PERCENT=(("+str(float(orderPrice))+" - BUY_ORDER_PRICE) / BUY_ORDER_PRICE) * 100, PROFIT_AMOUNT=("+str(
+                                        float(orderPrice))+" * QUANTITY) - (BUY_ORDER_PRICE * QUANTITY), TRADE_RESULT = IF ((("+str(float(orderPrice))+" * QUANTITY) - (BUY_ORDER_PRICE * QUANTITY)) > 0, 'GAIN','LOSS') WHERE SELL_ORDER_ID ='"+str(orderId)+"' AND TRADE_STATUS IN ('OPEN')")
+
+                        elif (orderStatus == 'REJECTED'):
+                            selectStatment = "SELECT TRADE_STATUS FROM TRADE_TRANSACTIONS WHERE SELL_ORDER_STATUS = 'ABANDONED' AND SELL_ORDER_ID='"+str(orderId)+"'"
+                            mySQLCursor.execute(selectStatment)
+                            rowCount = mySQLCursor.rowcount
+
+                            if rowCount == 0: 
+                                if (re.search('Check Holdings Including BTST', str(orderRemarks)) or re.search('NRO sqroff not allowed', str(orderRemarks))):
+                                    updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_STATUS='ABANDONED', SELL_ORDER_REMARKS ='" +
+                                                    str(orderRemarks) + "' WHERE SELL_ORDER_ID='"+str(orderId) + "' AND TRADE_STATUS NOT IN ('ABANDONED')")
+                                else:
+                                    updateQuery = ("UPDATE TRADE_TRANSACTIONS SET SELL_ORDER_STATUS='REJECTED', SELL_ORDER_REMARKS ='" +
+                                                    str(orderRemarks) + "' WHERE SELL_ORDER_ID='"+str(orderId) + "' AND TRADE_STATUS NOT IN ('REJECTED')")
+
+                    if (updateQuery != ""):
+                        mySQLCursor.execute(updateQuery)
+                        cnx.commit()
+                        
+
+                except Exception as e:
+                    alertMsg = f"Exception occurred in update_order_status_prostocks (inside): {str(e)}"
+                    util.add_logs(cnx, mySQLCursor, 'ERROR',  alertMsg, sysDict)                                
+                    pass
+    
+    except Exception as e:    
+        alertMsg = f"Exception occurred in update_order_status_prostocks: {str(e)}"
+        util.add_logs(cnx, mySQLCursor, 'ERROR',  alertMsg, sysDict)
+
+def update_indice_prices(cnx, mySQLCursor, kite):
+    response = {}
+    try:        
+        insertQuery = "UPDATE LAST_TRADED_INDICES_PRICE SET CLOSE_PRICE=%s, UPDATED_ON=%s WHERE INSTRUMENT_TOKEN=%s"
+
+        # Fetch list of all instruments from stock universe for the provided category
+        selectStatment = "SELECT INSTRUMENT_TOKEN, TRADINGSYMBOL FROM STOCK_UNIVERSE WHERE CATEGORY='Market Cap'"
+        mySQLCursor.execute(selectStatment)
+        results = mySQLCursor.fetchall()    
+        
+        insertArrayValues = []
+
+        tmpCnt = 0
+        for row in results:
+            instrumentToken = row[0]       
+            
+            # Get the last traded price for the insturments given
+            ltpData =  baf.get_ltp(kite, instrumentToken)
+            closePrice = ltpData[str(instrumentToken)]['last_price']
+          
+            updatedOn = util.get_date_time_formatted("%Y-%m-%d %H:%M:%S")
+
+            insertVal = []
+            insertVal.insert(0, str(closePrice))
+            insertVal.insert(1, str(updatedOn))
+            insertVal.insert(2, str(instrumentToken))
+
+        
+            insertArrayValues.insert(tmpCnt, insertVal)
+            tmpCnt += 1
+
+        if (tmpCnt > 0):                        
+            mySQLCursor.executemany(insertQuery, insertArrayValues)
+            cnx.commit()                  
+        
+        response['status'] = 'success'
+        response['remarks'] = 'Market Cap price records are updated'
+
+    except Exception as e:
+        response['status'] = 'failed'
+        response['remarks'] = 'Unable to update indice price records. The error is, ' + str(e)
+
+    return response
+
+def update_existing_portfolio(cnx, mySQLCursor, kite):
+    response = {}
+    try:
+        selectStatment = "SELECT AUTO_ID, INSTRUMENT_TOKEN, BUY_ORDER_PRICE, BUY_ORDER_DATE, QUANTITY, PREV_CLOSE_PRICE FROM MANUAL_PORTFOLIO"
+    
+        mySQLCursor.execute(selectStatment)
+        results = mySQLCursor.fetchall()                
+        currDateTime = util.get_date_time_formatted('%Y-%m-%d %H:%M:%S')
+        updateArrayValues = []
+        tmpCnt = 0    
+        updateQuery = ""
+
+        for row in results:
+            autoId = row[0]
+            instToken = str(row[1])
+            entryPrice = row[2]
+            entryDate = row[3]
+            quantity = row[4]        
+            prevClosePrice = row[5]
+            dayChageprofitPercent = 0
+            dayChangeprofitAmount = 0
+                    
+            getLTPData =  baf.get_ltp(kite, instToken)
+            ltpPrice = getLTPData[str(instToken)]['last_price']
+            # get profit for given qty
+            profitPercent, profitAmount = util.get_profit(float(entryPrice), float(ltpPrice), quantity)
+            if (float(prevClosePrice) == 0):
+                dayChageprofitPercent, dayChangeprofitAmount = util.get_profit(float(entryPrice), float(ltpPrice), quantity)
+            else:
+                dayChageprofitPercent, dayChangeprofitAmount = util.get_profit(float(prevClosePrice), float(ltpPrice), quantity)
+            
+            actualHorizon = 0
+            if (entryDate is not None and entryDate != ''):
+                actualHorizon = util.get_date_difference(entryDate)
+          
+
+            updateQuery = "UPDATE MANUAL_PORTFOLIO SET UPDATED_ON = %s, CURRENT_MKT_PRICE=%s, PROFIT_PERCENT=%s, PROFIT_AMOUNT=%s, \
+                ACTUAL_HORIZON=%s, TODAY_PROFIT_PCT=%s, TODAY_PROFIT=%s WHERE AUTO_ID= %s"
+            updateVal = []
+            updateVal.insert(0, str(currDateTime))
+            updateVal.insert(1, str(ltpPrice))
+            updateVal.insert(2, str(profitPercent))
+            updateVal.insert(3, str(profitAmount))                       
+            updateVal.insert(4, str(actualHorizon))
+            updateVal.insert(5, str(dayChageprofitPercent))
+            updateVal.insert(6, str(dayChangeprofitAmount))
+            updateVal.insert(7, str(autoId))
+               
+            updateArrayValues.insert(tmpCnt, updateVal)
+
+            tmpCnt += 1  
+            if (tmpCnt == 20):                
+                mySQLCursor.executemany(updateQuery, updateArrayValues) 
+                cnx.commit()   
+                tmpCnt = 0   
+                updateArrayValues = []
+
+
+    
+        if (tmpCnt > 0):       
+            mySQLCursor.executemany(updateQuery, updateArrayValues)
+            cnx.commit()    
+
+        response['status'] = 'success'        
+
+    except Exception as e:
+        response['status'] = 'failed'
+        response['remarks'] = 'Unable to update / complete the existing portfolio records. The error is, ' + str(e)
+
+    return response
+
+def update_all_trade_transactions(cnx, mySQLCursor, brokerApi, tradeAccount):
+    response = {}
+    
+    try:
+        selectStatment = f"SELECT AUTO_ID, INSTRUMENT_TOKEN, BUY_ORDER_PRICE, DATE(BUY_ORDER_DATE), \
+            QUANTITY, PREV_CLOSE_PRICE, MAX_PROFIT_PERCENT, MAX_PROFIT_AMOUNT, STRATEGY_ID, EXCHANGE, EXCHANGE_TOKEN \
+            FROM TRADE_TRANSACTIONS WHERE TRADE_ACCOUNT={tradeAccount} AND (TRADE_STATUS IN ('OPEN','P-OPEN') AND (EXIT_SIGNAL_STATUS IS NULL OR EXIT_SIGNAL_STATUS = '')) \
+                OR (TRADE_STATUS = 'OPEN' AND EXIT_SIGNAL_STATUS NOT IN ('EXIT SIGNAL') AND SELL_ORDER_STATUS NOT IN ('PENDING', 'COMPLETE')) \
+                    OR (TRADE_STATUS = 'OPEN' AND EXIT_SIGNAL_STATUS IN ('EXIT SIGNAL') AND SELL_ORDER_STATUS IN ('ABANDONED'))"
+
+ 
+        mySQLCursor.execute(selectStatment)
+        rowCount = mySQLCursor.rowcount     
+        if rowCount > 0:      
+
+            results = mySQLCursor.fetchall()
+
+            currDateTime = util.get_date_time_formatted('%Y-%m-%d %H:%M:%S')
+            updateArrayValues = []
+            tmpCnt = 0    
+            
+            updateQuery = ""
+
+            for row in results:
+                autoId = row[0]
+                instToken = str(row[1])
+                entryPrice = row[2]    
+                entryDate = row[3]
+                quantity = row[4]
+                prevClosePrice = row[5]
+                maxProfitPercent = row[6]
+                maxProfitAmount = row[7]
+                strategyId = row[8]
+                exchange = row[9]
+                exchangeToken = row[10]
+                dayChageprofitPercent = 0
+                dayChangeprofitAmount = 0
+
+                try:            
+                    
+                    ltpPrice = get_last_traded_price(brokerApi, exchangeToken, exchange=exchange)
+
+                    # get profit for given qty
+                    profitPercent, profitAmount = util.get_profit(float(entryPrice), float(ltpPrice), quantity)
+
+                    if (float(profitPercent) > float(maxProfitPercent)):
+                        maxProfitPercent = profitPercent
+                        maxProfitAmount = profitAmount
+
+                    if (float(prevClosePrice) == 0):
+                        dayChageprofitPercent, dayChangeprofitAmount = util.get_profit(float(entryPrice), float(ltpPrice), quantity)
+                    else:
+                        dayChageprofitPercent, dayChangeprofitAmount = util.get_profit(float(prevClosePrice), float(ltpPrice), quantity)
+
+                    actualHorizon = util.get_date_difference(entryDate)            
+                        
+                    updateQuery = "UPDATE TRADE_TRANSACTIONS SET UPDATED_ON = %s, CURRENT_MKT_PRICE=%s, PROFIT_PERCENT=%s, PROFIT_AMOUNT=%s, \
+                        ACTUAL_HORIZON=%s, TODAY_PROFIT_PCT=%s, TODAY_PROFIT=%s, MAX_PROFIT_AMOUNT=%s, MAX_PROFIT_PERCENT=%s WHERE AUTO_ID= %s"
+                    
+                    updateVal = []
+                    updateVal.insert(0, str(currDateTime))            
+                    updateVal.insert(1, str(ltpPrice))
+                    updateVal.insert(2, str(profitPercent))
+                    updateVal.insert(3, str(profitAmount))                                            
+                    updateVal.insert(4, str(actualHorizon))
+                    updateVal.insert(5, str(dayChageprofitPercent))
+                    updateVal.insert(6, str(dayChangeprofitAmount))
+                    updateVal.insert(7, str(maxProfitAmount))
+                    updateVal.insert(8, str(maxProfitPercent))
+                    updateVal.insert(9, str(autoId))
+                    updateArrayValues.insert(tmpCnt, updateVal)
+                    
+                    tmpCnt += 1  
+                    if (tmpCnt == 50):                
+                        mySQLCursor.executemany(updateQuery, updateArrayValues) 
+                        cnx.commit()   
+                        tmpCnt = 0   
+                        updateArrayValues = []
+
+                except Exception as e:                                 
+                    alertMsg = f"Exception occurred while updating indivtual CMP records in update_all_trade_transactions: {str(e)}"
+                    util.add_logs(cnx, mySQLCursor, 'ERROR',  alertMsg, sysDict)
+                    pass
+            
+            if (tmpCnt > 0):       
+                mySQLCursor.executemany(updateQuery, updateArrayValues)
+                cnx.commit()    
+
+        response['status'] = 'success'        
+
+    except Exception as e:
+        response['status'] = 'failed'
+        response['remarks'] = 'Exception occurred in update_all_trade_transactions. The error is, ' + str(e)
+
+    return response        
+
+def update_advance_decline_ratio(kite, mySQLCursor, cnx):
+    response = {}
+    try:
+        instList = util.get_all_fno_inst_list(mySQLCursor)  
+        interval =  'day'
+        patternSignal30List = []
+        patternSignal30Dict = {}
+        start=datetime.datetime.now()
+        for instRow in instList:
+            instrumentToken = instRow[0]                        
+            patternSignal30List, patternSignal30Dict = util.get_advance_decline_ratio(kite, instrumentToken, interval, patternSignal30List, patternSignal30Dict)
+
+        sellCount = patternSignal30List.count('Sell')
+        buyCount = patternSignal30List.count('Buy')
+        totalCount = len(patternSignal30List)                    
+        buyRatio = ( buyCount / totalCount ) * 100
+        sellRatio = ( sellCount / totalCount ) * 100
+
+        util.add_logs(cnx, mySQLCursor, 'UPDATE',  f"buyCount: {buyCount} sellCount: {sellCount}", sysDict)
+        util.add_logs(cnx, mySQLCursor, 'UPDATE',  f"buyRatio: {buyRatio} sellRatio: {sellRatio}", sysDict) 
+        
+        updatedOn = util.get_date_time_formatted("%Y-%m-%d %H:%M:%S")                    
+        mySQLCursor.execute(f"INSERT INTO BUY_SELL_RATIO (INTERVAL_TIME, BUY_COUNT, SELL_COUNT, BUY_RATIO, SELL_RATIO, PORTFOLIO_PROFIT_PCT, UPDATED_ON) VALUES ('{interval}',{str(buyCount)}, {str(sellCount)}, {str(buyRatio)}, {str(sellRatio)}, (SELECT AVG(PROFIT_PERCENT) FROM TRADE_TRANSACTIONS WHERE TRADE_STATUS='OPEN'), '{str(updatedOn)}')")
+        cnx.commit()
+
+        updatedOn = util.get_date_time_formatted("%Y-%m-%d %H:%M:%S") 
+
+        updateQuery = f"UPDATE SYS_SETTINGS SET VALUE='{updatedOn}' WHERE VARIABLE='ADV_DEC_RATIO_UPDATED_TIME'"
+        mySQLCursor.execute(updateQuery)
+        cnx.commit()
+
+        response['status'] = 'success'        
+
+    except Exception as e:
+        response['status'] = 'failed'
+        response['remarks'] = 'Exception occurred in update_advance_decline_ratio. The error is, ' + str(e)
+
+    return response         
+
+def update_addtional_trans_data(cnx, mySQLCursor, brokerApi, tradeAccount):
+    response = {}
+    try:
+        selectStatment = f"SELECT AUTO_ID, INSTRUMENT_TOKEN, TRADE_SYMBOL, OPTION_STRIKE_PRICE, EXPIRY_DATE, BASE_INSTRUMENT_TOKEN, EXCHANGE, EXCHANGE_TOKEN \
+            INSTRUMENT_TYPE FROM TRADE_TRANSACTIONS WHERE TRADE_ACCOUNT={tradeAccount} AND TRADE_STATUS ='OPEN' AND INSTRUMENT_TYPE IN ('PUT', 'CALL')"
+        mySQLCursor.execute(selectStatment)
+        rowCount = mySQLCursor.rowcount     
+        # Profit and Loss update for EXIT BUY
+        if rowCount > 0:      
+            results = mySQLCursor.fetchall()                
+            currDateTime = util.get_date_time_formatted('%Y-%m-%d %H:%M:%S')            
+            for row in results:
+
+                ttAutoId = row[0] 
+                futInstToken = row[1] 
+                tradeSymbol = row[2] 
+                strikePrice = row[3]  
+                rawExpiry = row[4]  
+                baseInstToken = str(row[5])
+                instrumentType = row[6]
+                exchange = row[7]
+                exchangeToken = str(row[8])
+                
+                ltpPrice = get_last_traded_price(brokerApi, exchangeToken, exchange=exchange)
+
+                bsmDataDict = bsm_options_pricing(brokerApi, exchangeToken, exchange, strikePrice, rawExpiry, ltpPrice, tradeSymbol, instrumentType)
+                
+                if (bsmDataDict['status'] == 'success'):
+
+                    updateQuery = f"UPDATE TRANSACTIONS_ADDITIONAL_DATA SET UPDATED_ON='{currDateTime}', CURRENT_DELTA={bsmDataDict['delta']}, CURRENT_THETA={bsmDataDict['theta']}, \
+                        CURRENT_GAMMA={bsmDataDict['gamma']}, CURRENT_VEGA={bsmDataDict['vega']}, CURRENT_IMPLIED_VOLATILITY={bsmDataDict['IMPLIED_VOLATILITY']} WHERE TT_AUTO_ID={ttAutoId}" 
+                
+                    mySQLCursor.execute(updateQuery) 
+                    cnx.commit()   
+            
+        response['status'] = 'success'     
+    except Exception as e:                                 
+        response['status'] = 'failed'
+        response['remarks'] = 'Exception occurred while updating update_addtional_trans_data. The error is, ' + str(e)    
+
+    return response
+
+def update_max_loss(cnx, mySQLCursor, tradeAccount):
+    response = {}
+    try:
+        selectQuery = f"SELECT O.BUY_VALUE, F.BUY_ORDER_PRICE, O.OPTION_STRIKE_PRICE, ABS(O.QUANTITY), A.POSITIONS_GROUP_ID, O.AUTO_ID, F.AUTO_ID FROM TRADE_TRANSACTIONS AS A \
+                    LEFT JOIN TRADE_TRANSACTIONS AS O ON O.POSITIONS_GROUP_ID = A.POSITIONS_GROUP_ID AND (O.INSTRUMENT_TYPE='CALL' OR O.INSTRUMENT_TYPE='PUT')  AND O.TRADE_STATUS = 'OPEN' \
+                    LEFT JOIN TRADE_TRANSACTIONS AS F ON F.POSITIONS_GROUP_ID = A.POSITIONS_GROUP_ID AND F.INSTRUMENT_TYPE='FUT' AND F.TRADE_STATUS = 'OPEN'  \
+                    WHERE A.TRADE_ACCOUNT={tradeAccount} AND A.STRATEGY_ID IN ('ALPHA_10A', 'ALPHA_10B', 'ALPHA_4A') AND A.TRADE_STATUS ='OPEN' AND A.MAX_LOSS = 0	GROUP BY A.POSITIONS_GROUP_ID"
+                    
+        mySQLCursor.execute(selectQuery)
+        rowCount = mySQLCursor.rowcount     
+        # Profit and Loss update for EXIT BUY
+        if rowCount == 1:                                         
+            results = mySQLCursor.fetchall()                                                            
+        
+            for row in results:                                            
+                oBuyValue =  0 if row[0] is None else float(row[0])
+                fBuyOrderPrice= 0 if row[1] is None else float(row[1])
+                oOptionStrikePrice = 0 if row[2] is None else float(row[2])
+                quantity = 0 if row[3] is None else int(row[3])
+                posGroupId = row[4]
+                oAutoId = row[5]
+                fAutoId = row[6]
+                maxLoss = abs(oBuyValue + ((fBuyOrderPrice - oOptionStrikePrice) * quantity))
+
+                updateQuery = f"UPDATE TRADE_TRANSACTIONS SET MAX_LOSS={maxLoss} WHERE POSITIONS_GROUP_ID = '{posGroupId}'"
+        
+                mySQLCursor.execute(updateQuery) 
+                cnx.commit()
+
+        response['status'] = 'success'     
+    except Exception as e:                                 
+        response['status'] = 'failed'
+        response['remarks'] = 'Exception occurred while updating update_max_loss. The error is, ' + str(e)    
+
+    return response
+
+
+def validate_prostocks_connection(brokerApi, cnx, mySQLCursor, accountId):
+    try:
+        updatedOn = util.get_date_time_formatted('%Y-%m-%d %H:%M:%S')       
+        responseData = brokerApi.get_limits()
+
+        if (responseData['stat'] == 'Not_Ok'):
+            updateQuery = ("UPDATE USR_TRADE_ACCOUNTS SET ACCESS_TOKEN_VALID_FLAG = 'N', UPDATED_ON='" + str(updatedOn) + "' WHERE TRADE_ACCOUNT = '"+str(accountId)+"'") 
+            mySQLCursor.execute(updateQuery) 
+            cnx.commit()  
+            return False
+        else:
+            updateQuery = ("UPDATE USR_TRADE_ACCOUNTS SET ACCESS_TOKEN_VALID_FLAG = 'Y', UPDATED_ON='" + str(updatedOn) + "' WHERE TRADE_ACCOUNT = '"+str(accountId)+"'") # ACCESS_TOKEN_VALID_FLAG='N' update when error occurs 
+            mySQLCursor.execute(updateQuery)
+            cnx.commit()              
+            return True        
+
+    except Exception as e:
+        logging.info("ERROR OCCURED WHILE TRYING TO CONNECT PROSTOCKS: Invalid Token" + str(e))        
+        updateQuery = ("UPDATE USR_TRADE_ACCOUNTS SET ACCESS_TOKEN_VALID_FLAG = 'N', UPDATED_ON='" + str(updatedOn) + "' WHERE TRADE_ACCOUNT = '"+str(accountId)+"'") # ACCESS_TOKEN_VALID_FLAG='N' update when error occurs 
+        mySQLCursor.execute(updateQuery)
+        cnx.commit()  
+        return False
+
+def connect_prostocks_api(cnx, mySQLCursor, accountId):
+    try: 
+        createdOn = util.get_date_time_formatted('%Y-%m-%d %H:%M:%S')
+        currDate = util.get_date_time_formatted("%Y-%m-%d")         
+        selectStatment = "SELECT API_PIN, PASSWORD, API_KEY, ACCESS_TOKEN, ACCESS_TOKEN_VALID_FLAG, DATE(UPDATED_ON), REQUEST_TOKEN FROM USR_TRADE_ACCOUNTS WHERE TRADE_ACCOUNT = '"+ str(accountId)+"'"
+        mySQLCursor.execute(selectStatment)
+            # gets the number of rows affected by the command executed
+        results = mySQLCursor.fetchall()    
+
+        apiKey = ''
+        apiPin = ''
+        password = ''
+        accessTokenValidFlag = 'N'
+        updatedOn = ''
+        accessToken = ''
+
+        for row in results:
+            apiPin = row[0]
+            password = row[1]
+            apiKey = row[2]
+            accessToken = row[3]
+            accessTokenValidFlag = row[4]
+            updatedOn = row[5]
+            vendorKey = row[6]
+        
+        apiSession = StarApiPy()
+        if ((currDate != updatedOn.strftime("%Y-%m-%d") or str(accessTokenValidFlag) == 'N')):
+            # data = """jData={"apkversion":"1.0.0", "uid":\""""+ str(accountId) +"""\", "pwd":\""""+password+"""\", "factor2":\""""+apiPin+"""\", "imei":"ag3tbbbb33", "source":"API", "vc":\""""+vendorKey+"""\", "appkey":\""""+ apiKey +"""\"}"""
+            apiResponse = apiSession.login(userid = accountId, password = password, twoFA=apiPin, vendor_code=vendorKey, api_secret=apiKey, imei='ag3tbbbb33')
+            if apiResponse != None:
+                # response = requests.post('https://starapi.prostocks.com/NorenWClientTP/QuickAuth', data=data)
+                accessToken = apiResponse['susertoken']
+                updateQuery = ("UPDATE USR_TRADE_ACCOUNTS SET UPDATED_ON='" + str(createdOn) + "', ACCESS_TOKEN ='" + str(accessToken) + "' WHERE TRADE_ACCOUNT = '"+ str(accountId)+"'")
+                mySQLCursor.execute(updateQuery)
+                cnx.commit()
+        else:
+            apiSession.set_session(accountId,password,accessToken)
+
+    except Exception as e:
+        logging.info(f"Can't connect to prostocks API for account id {str(e)}")
+        return "", False
+    
+
+# connect to broker account api via account id
+def connect_broker_api(cnx, mySQLCursor, accountId, broker):
+    if (broker == 'PROSTOCKS'):
+        apiSession  = connect_prostocks_api(cnx, mySQLCursor, accountId)
+        isConnected = validate_prostocks_connection(apiSession, cnx, mySQLCursor, accountId)
+        return apiSession, isConnected
+
+def process_broker_data(tradeAccount):
+    accountId = tradeAccount[0]
+    broker = tradeAccount[1]    
+    print(f"Processing the trade account {accountId} from broker {broker}")
+    cnx, mySQLCursor = util.connect_mysql_db()
+    
+    brokerApi = None
+    isApiConnected = False
+
+    if (broker == 'PROSTOCKS'):
+        brokerApi, isApiConnected = connect_broker_api(cnx, mySQLCursor, accountId, broker)
+    
+        try: 
+            update_order_status_prostocks(brokerApi, cnx, mySQLCursor, accountId)    
+            availableCash, totalCashValue, usedMargin, availableMargin = get_margin_data(brokerApi, broker, accountId) 
+            
+            if (availableCash != -1):
+                update_cash_positions(cnx, mySQLCursor, accountId, availableCash, totalCashValue, usedMargin, availableMargin) 
+            
+            # Update all the transactions PNL and current market prices
+            response = update_all_trade_transactions(cnx, mySQLCursor, brokerApi, accountId)
+            if (response['status'] == 'failed'):                                  
+                util.add_logs(cnx, mySQLCursor, 'ERROR',  response['remarks'], sysDict)   
+
+            # Update the additional options data such as IV, theta, gamma etc...
+            response = update_addtional_trans_data(cnx, mySQLCursor, brokerApi, accountId)
+            if (response['status'] == 'failed'):                                  
+                util.add_logs(cnx, mySQLCursor, 'ERROR',  response['remarks'], sysDict)
+            
+            # Update the max loss for certain strategies
+            response = update_max_loss(cnx, mySQLCursor, accountId)
+            if (response['status'] == 'failed'):                                  
+                util.add_logs(cnx, mySQLCursor, 'ERROR',  response['remarks'], sysDict)
+            
+            # Update the indice prices
+            response = update_indice_prices(cnx, mySQLCursor, brokerApi, accountId)
+            if (response['status'] == 'failed'):                                                                      
+                util.add_logs(cnx, mySQLCursor, 'ERROR',  response['remarks'], sysDict)
+
+
+        except Exception as e:
+            alertMsg = 'Exceptions occured while updating PROSTOCKS orders and margin details: ' + str(e)                  
+            util.add_logs(cnx, mySQLCursor, 'ERROR',  alertMsg, sysDict)
+
+
+                 
+# Main function is called by default, and the first function to be executed
+if __name__ == "__main__":    
+
+    telegramAdminIds = Config.TELG_ADMIN_ID
+    adminTradeAccount = Config.ADMIN_TRADE_ACCOUNT
+    adminTradeBroker = Config.ADMIN_TRADE_BROKER
+    programName = os.path.splitext(os.path.basename(__file__))[0]
+    sysDict = {}
+    sysDict['programName'] = programName
+    sysDict['telegramAdminIds'] = telegramAdminIds
+
+    # Initialized the log files 
+    util.initialize_logs(str(programName) + '.log')
+
+    programExitFlag = True
+    
+    # Connect to MySQL database
+    cnx, mySQLCursor = util.connect_mysql_db()
+    # Continuously run the program until the exit flag turns to False
+    while programExitFlag:
+        try:
+            currDate = util.get_date_time_formatted("%Y-%m-%d")
+
+            alertMsg = f"The program ({programName}) started"
+            util.add_logs(cnx, mySQLCursor, 'ALERT', alertMsg, sysDict)            
+
+            # Verify whether the connection to MySQL database is open
+            cnx, mySQLCursor = util.verify_db_connection(cnx, mySQLCursor)
+
+            cycleStartTime = util.get_system_time()                 
+            sysSettings = util.load_constant_variables(mySQLCursor, 'SYS_SETTINGS')
+            currentTime = util.get_date_time_formatted("%H%M")
+
+            if (Config.TESTING_FLAG or (int(currentTime) <= int(sysSettings['SYSTEM_UPDATE_SVC_END_TIME']))):
+                start=datetime.datetime.now()
+                
+                adminApi, isApiConnected = connect_broker_api(cnx, mySQLCursor, adminTradeAccount, adminTradeBroker)
+                
+                # Update the indice prices
+                response = update_indice_prices(cnx, mySQLCursor, adminApi)
+                if (response['status'] == 'failed'):                                                                      
+                    util.add_logs(cnx, mySQLCursor, 'ERROR',  response['remarks'], sysDict)
+
+                # Calculate the BUY and SELL ratio at every 30 mins
+                advDeclineLastUpdatedTime = (datetime.datetime.strptime(sysSettings['ADV_DEC_RATIO_UPDATED_TIME'], '%Y-%m-%d %H:%M:%S')).strftime("%H%M")
+            
+                if (abs(int(currentTime) - int(advDeclineLastUpdatedTime)) >= int(sysSettings['ADV_DEC_RATIO_RUN_EVERY_MINS'])):
+                    response = update_advance_decline_ratio(adminApi, mySQLCursor, cnx)
+                        
+                    if (response['status'] == 'failed'):                                  
+                        util.add_logs(cnx, mySQLCursor, 'ERROR',  response['remarks'], sysDict)
+                
+                end=datetime.datetime.now()                                        
+
+            else:                    
+                util.add_logs(cnx, mySQLCursor, 'INFO',  'System end time reached; exiting the program now' , sysDict)
+                programExitFlag = 'Y'
+            
+            util.update_program_running_status(cnx, mySQLCursor, programName, 'ACTIVE')
+            
+            cnx.commit()
+        
+        except Exception as e:
+            alertMsg = 'Live trade update service failed (main block): '+ str(e)
+            util.add_logs(cnx, mySQLCursor, 'ERROR',  alertMsg, sysDict)
+
+    
+    util.disconnect_db(cnx, mySQLCursor)
